@@ -1,9 +1,9 @@
 # IMSI number of the UE. IMSI = [MCC|MNC|MSISDN] (In total 15 digits)
-supi: 'imsi-999700000000001'
+supi: 'imsi-001010000000001' #'imsi-999700000000001'
 # Mobile Country Code value of HPLMN
-mcc: '999'
+mcc: '001' #'999'
 # Mobile Network Code value of HPLMN (2 or 3 digits)
-mnc: '70'
+mnc: '01' #'70'
 # SUCI Protection Scheme : 0 for Null-scheme, 1 for Profile A and 2 for Profile B
 protectionScheme: 0
 # Home Network Public Key for protecting with SUCI Profile A
@@ -53,6 +53,7 @@ sessions:
     apn: 'internet'
     slice:
       sst: 1
+      #sd: '010203'
 
 # Configured NSSAI for this UE by HPLMN
 configured-nssai:
@@ -79,3 +80,4 @@ ciphering:
 integrityMaxRate:
   uplink: 'full'
   downlink: 'full'
+

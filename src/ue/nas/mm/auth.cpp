@@ -14,6 +14,19 @@
 namespace nr::ue
 {
 
+/*
+ * If the NAS Authentication Request contains an EAP payload equal to EDHOC-START,
+ * the UE does not run real EDHOC yet. Instead, it creates a dummy NAS security
+ * context from a fixed dummy K_AUSF, derives K_SEAF/K_AMF, and replies with an
+ * EAP Notification carrying EDHOC-RESPONSE.
+ */
+static const uint8_t EDHOC_DUMMY_KAUSF_SEED[32] = {
+    0x45, 0x44, 0x48, 0x4f, 0x43, 0x5f, 0x50, 0x53,
+    0x4b, 0x5f, 0x44, 0x55, 0x4d, 0x4d, 0x59, 0x01,
+    0x45, 0x44, 0x48, 0x4f, 0x43, 0x5f, 0x50, 0x53,
+    0x4b, 0x5f, 0x44, 0x55, 0x4d, 0x4d, 0x59, 0x02,
+};
+
 void NasMm::receiveAuthenticationRequest(const nas::AuthenticationRequest &msg)
 {
     m_logger->debug("Authentication Request received");
@@ -26,6 +39,8 @@ void NasMm::receiveAuthenticationRequest(const nas::AuthenticationRequest &msg)
 
     m_timers->t3520.start();
 
+    // with eapMessage → EAP-based path, which also includes EDHOC bootstrap
+    // without eapMessage → normal 5G-AKA path
     if (msg.eapMessage.has_value())
         receiveAuthenticationRequestEap(msg);
     else
@@ -37,6 +52,45 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
     Plmn currentPlmn = m_base->shCtx.getCurrentPlmn();
     if (!currentPlmn.hasValue())
         return;
+
+    auto sendDummyEdhocResponse = [this, &msg, &currentPlmn](const eap::EapNotification &receivedEap) {
+        // If the incoming EAP payload is a Notification and its content is exactly:
+        // “This is not ordinary EAP-AKA'; this is the prototype trigger for the EDHOC-PSK path.”
+        if (receivedEap.rawData.toHexString() != OctetString::FromAscii("EDHOC-START").toHexString())
+            return false;
+        m_logger->info("EDHOC: received dummy authentication request");
+        // Since this is not AKA, the UE clears the AKA challenge/response temporary values.
+        m_usim->m_rand = {};
+        m_usim->m_resStar = {};
+
+        /*
+        *  it allocates a new partial native NAS security context
+        *  it copies: ngKSI, ABBA, and sets kAusf = dummy seed
+        *  So for the rest of the UE stack, it now looks like
+        *  “Authentication has yielded a valid K_AUSF-like input, from which I can continue the standard 5GS key ladder.”
+         */
+        m_usim->m_nonCurrentNsCtx = std::make_unique<NasSecurityContext>();
+        m_usim->m_nonCurrentNsCtx->tsc = msg.ngKSI.tsc;
+        m_usim->m_nonCurrentNsCtx->ngKsi = msg.ngKSI.ksi;
+        m_usim->m_nonCurrentNsCtx->keys.kAusf =
+            OctetString::FromArray(EDHOC_DUMMY_KAUSF_SEED, sizeof(EDHOC_DUMMY_KAUSF_SEED));
+        m_usim->m_nonCurrentNsCtx->keys.abba = msg.abba.rawData.copy();
+
+        // “Once I have a K_AUSF-shaped input, I re-enter the standard 5GS key derivation chain.”
+        keys::DeriveKeysSeafAmf(*m_base->config, currentPlmn, *m_usim->m_nonCurrentNsCtx);
+
+        m_nwConsecutiveAuthFailure = 0;
+        m_timers->t3520.stop();
+
+        nas::AuthenticationResponse resp;
+        resp.eapMessage = nas::IEEapMessage{};
+        resp.eapMessage->eap = std::make_unique<eap::EapNotification>(
+            eap::ECode::RESPONSE, receivedEap.id,
+            OctetString::FromAscii("EDHOC-RESPONSE"));
+        m_logger->info("EDHOC: sending dummy authentication response");
+        sendNasMessage(resp);
+        return true;
+    };
 
     auto sendEapFailure = [this](std::unique_ptr<eap::Eap> &&eap) {
         // Clear RAND and RES* stored in volatile memory
@@ -72,6 +126,15 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
 
     if (!msg.eapMessage.has_value() || !msg.eapMessage->eap)
     {
+        sendMmStatus(nas::EMmCause::SEMANTICALLY_INCORRECT_MESSAGE);
+        return;
+    }
+
+    if (msg.eapMessage->eap->eapType == eap::EEapType::NOTIFICATION)
+    {
+        if (sendDummyEdhocResponse((const eap::EapNotification &)*msg.eapMessage->eap))
+            return;
+
         sendMmStatus(nas::EMmCause::SEMANTICALLY_INCORRECT_MESSAGE);
         return;
     }
