@@ -8,6 +8,7 @@
 
 #include "mm.hpp"
 
+#include <lakers.h>
 #include <lib/nas/utils.hpp>
 #include <ue/nas/keys.hpp>
 
@@ -54,6 +55,12 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
         return;
 
     auto sendDummyEdhocResponse = [this, &msg, &currentPlmn](const eap::EapNotification &receivedEap) {
+        EdhocInitiator initiator{};
+        EadItemsC ead1{};
+        EdhocMessageBuffer message1{};
+        uint8_t cI = 0;
+        int8_t rc = 0;
+
         // If the incoming EAP payload is a Notification and its content is exactly:
         // “This is not ordinary EAP-AKA'; this is the prototype trigger for the EDHOC-PSK path.”
         if (receivedEap.rawData.toHexString() != OctetString::FromAscii("EDHOC-START").toHexString())
@@ -82,12 +89,27 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
         m_nwConsecutiveAuthFailure = 0;
         m_timers->t3520.stop();
 
+        rc = initiator_new(&initiator, PSK);
+        if (rc != 0)
+        {
+            m_logger->err("EDHOC: initiator_new failed [%d]", rc);
+            return false;
+        }
+
+        rc = initiator_prepare_message_1(&initiator, &cI, &ead1, &message1);
+        if (rc != 0)
+        {
+            m_logger->err("EDHOC: initiator_prepare_message_1 failed [%d]", rc);
+            return false;
+        }
+
         nas::AuthenticationResponse resp;
         resp.eapMessage = nas::IEEapMessage{};
         resp.eapMessage->eap = std::make_unique<eap::EapNotification>(
             eap::ECode::RESPONSE, receivedEap.id,
-            OctetString::FromAscii("EDHOC-RESPONSE"));
-        m_logger->info("EDHOC: sending dummy authentication response");
+            OctetString::FromArray(message1.content, message1.len));
+        m_logger->info("EDHOC: sending real message_1 in authentication response [len=%d, c_i=%u]",
+                       message1.len, cI);
         sendNasMessage(resp);
         return true;
     };
