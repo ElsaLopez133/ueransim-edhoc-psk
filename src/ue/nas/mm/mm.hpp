@@ -78,6 +78,7 @@ class NasMm
     // Last time MM state changed
     int64_t m_lastTimeMmStateChange{};
     bool m_edhocInProgress{};
+    bool m_edhocAwaitingMessage4{};
     EdhocInitiator m_edhocInitiator{};
     CredentialC m_edhocCredR{};
     uint8_t m_edhocCi{};

@@ -39,6 +39,9 @@ static const uint8_t EDHOC_PSK_CRED_R[] = {
     0x50, 0x50, 0x93, 0x0F, 0xF4, 0x62, 0xA7, 0x7A, 0x35, 0x40, 0xCF,
     0x54, 0x63, 0x25, 0xDE, 0xA2, 0x14,
 };
+static const uint8_t EDHOC_M4_ACK[] = {
+    0x45, 0x44, 0x48, 0x4f, 0x43, 0x2d, 0x4d, 0x34, 0x2d, 0x41, 0x43, 0x4b,
+};
 
 void NasMm::receiveAuthenticationRequest(const nas::AuthenticationRequest &msg)
 {
@@ -70,9 +73,11 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
         EadItemsC ead1{};
         EadItemsC ead2{};
         EadItemsC ead3{};
+        EadItemsC ead4{};
         EdhocMessageBuffer message1{};
         EdhocMessageBuffer message2{};
         EdhocMessageBuffer message3{};
+        EdhocMessageBuffer message4{};
         IdCred idCredR{};
         uint8_t cI = 0;
         uint8_t cR = 0;
@@ -85,6 +90,45 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
         // “This is not ordinary EAP-AKA'; this is the prototype trigger for the EDHOC-PSK path.”
         if (receivedEap.rawData.toHexString() != OctetString::FromAscii("EDHOC-START").toHexString())
         {
+            if (m_edhocAwaitingMessage4)
+            {
+                // Third EDHOC leg on UE: receive/process message_4, then acknowledge it.
+                if (receivedEap.rawData.length() <= 0 ||
+                    receivedEap.rawData.length() > static_cast<int>(sizeof(message4.content)))
+                {
+                    m_logger->err("EDHOC: invalid message_4 length [%d]", receivedEap.rawData.length());
+                    m_edhocAwaitingMessage4 = false;
+                    return false;
+                }
+
+                message4.len = receivedEap.rawData.length();
+                std::memcpy(message4.content, receivedEap.rawData.data(), message4.len);
+
+                rc = initiator_process_message_4(&m_edhocInitiator, &message4, &ead4);
+                if (rc != 0)
+                {
+                    m_logger->err("EDHOC: initiator_process_message_4 failed [%d]", rc);
+                    m_edhocAwaitingMessage4 = false;
+                    return false;
+                }
+
+                // NOTE: This is NOT an EDHOC protocol message and not required by EDHOC-PSK.
+                // It is a transport/state-machine trigger for the current Open5GS integration,
+                // where AUSF/AMF expects one additional UE AuthenticationResponse after relaying
+                // EDHOC message_4 before proceeding with normal 5GS flow.
+                // FIXME(open5gs-edhoc): remove this extra EAP Notification once AUSF/AMF is
+                // refactored to finalize authentication immediately after message_4.
+                nas::AuthenticationResponse resp;
+                resp.eapMessage = nas::IEEapMessage{};
+                resp.eapMessage->eap = std::make_unique<eap::EapNotification>(
+                    eap::ECode::RESPONSE, receivedEap.id,
+                    OctetString::FromArray(EDHOC_M4_ACK, sizeof(EDHOC_M4_ACK)));
+                m_logger->info("EDHOC: processed message_4 and sent post-message_4 acknowledgement");
+                sendNasMessage(resp);
+                m_edhocAwaitingMessage4 = false;
+                return true;
+            }
+
             if (!m_edhocInProgress)
                 return false;
 
@@ -145,8 +189,6 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
                 return false;
             }
 
-            completed_without_message_4(&m_edhocInitiator);
-
             nas::AuthenticationResponse resp;
             resp.eapMessage = nas::IEEapMessage{};
             resp.eapMessage->eap = std::make_unique<eap::EapNotification>(
@@ -156,6 +198,7 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
                            static_cast<int>(message3.len), cR);
             sendNasMessage(resp);
             m_edhocInProgress = false;
+            m_edhocAwaitingMessage4 = true;
             return true;
         }
 
@@ -217,6 +260,7 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
             return false;
         }
         m_edhocInProgress = true;
+        m_edhocAwaitingMessage4 = false;
         m_edhocCi = cI;
 
         nas::AuthenticationResponse resp;
@@ -627,6 +671,8 @@ void NasMm::receiveAuthenticationReject(const nas::AuthenticationReject &msg)
     m_usim->m_rand = {};
     m_usim->m_resStar = {};
     m_timers->t3516.stop();
+    m_edhocInProgress = false;
+    m_edhocAwaitingMessage4 = false;
 
     if (msg.eapMessage.has_value() && msg.eapMessage->eap)
     {
@@ -659,7 +705,9 @@ void NasMm::receiveAuthenticationReject(const nas::AuthenticationReject &msg)
 
 void NasMm::receiveEapSuccessMessage(const eap::Eap &eap)
 {
-    // do nothing
+    // EAP success finalizes authentication; clear any EDHOC transient state.
+    m_edhocInProgress = false;
+    m_edhocAwaitingMessage4 = false;
 }
 
 void NasMm::receiveEapFailureMessage(const eap::Eap &eap)
@@ -668,6 +716,8 @@ void NasMm::receiveEapFailureMessage(const eap::Eap &eap)
 
     // UE shall delete the partial native 5G NAS security context if any was created
     m_usim->m_nonCurrentNsCtx = {};
+    m_edhocInProgress = false;
+    m_edhocAwaitingMessage4 = false;
 }
 
 EAutnValidationRes NasMm::validateAutn(const OctetString &rand, const OctetString &autn)
