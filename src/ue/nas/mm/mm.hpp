@@ -21,6 +21,12 @@
 #include "ext/crypt-ext/x963kdf.h"
 #include "ext/crypt-ext/aes.hpp"
 #include "ext/crypt-ext/hmac-sha256.h"
+/* lakers_shared.h uses anonymous structs; suppress pedantic warning locally
+ * so it does not flood all UE translation units. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#include <lakers.h>
+#pragma GCC diagnostic pop
 
 
 namespace nr::ue
@@ -71,6 +77,10 @@ class NasMm
     int64_t m_lastTimePlmnSearchFailureLogged{};
     // Last time MM state changed
     int64_t m_lastTimeMmStateChange{};
+    bool m_edhocInProgress{};
+    EdhocInitiator m_edhocInitiator{};
+    CredentialC m_edhocCredR{};
+    uint8_t m_edhocCi{};
 
     friend class UeCmdHandler;
     friend class NasSm;

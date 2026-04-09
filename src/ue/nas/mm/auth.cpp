@@ -8,7 +8,7 @@
 
 #include "mm.hpp"
 
-#include <lakers.h>
+#include <cstring>
 #include <lib/nas/utils.hpp>
 #include <ue/nas/keys.hpp>
 
@@ -26,6 +26,18 @@ static const uint8_t EDHOC_DUMMY_KAUSF_SEED[32] = {
     0x4b, 0x5f, 0x44, 0x55, 0x4d, 0x4d, 0x59, 0x01,
     0x45, 0x44, 0x48, 0x4f, 0x43, 0x5f, 0x50, 0x53,
     0x4b, 0x5f, 0x44, 0x55, 0x4d, 0x4d, 0x59, 0x02,
+};
+static const uint8_t EDHOC_PSK_CRED_I[] = {
+    0xA2, 0x02, 0x69, 0x69, 0x6E, 0x69, 0x74, 0x69, 0x61, 0x74, 0x6F,
+    0x72, 0x08, 0xA1, 0x01, 0xA3, 0x01, 0x04, 0x02, 0x41, 0x10, 0x20,
+    0x50, 0x50, 0x93, 0x0F, 0xF4, 0x62, 0xA7, 0x7A, 0x35, 0x40, 0xCF,
+    0x54, 0x63, 0x25, 0xDE, 0xA2, 0x14,
+};
+static const uint8_t EDHOC_PSK_CRED_R[] = {
+    0xA2, 0x02, 0x69, 0x72, 0x65, 0x73, 0x70, 0x6F, 0x6E, 0x64, 0x65,
+    0x72, 0x08, 0xA1, 0x01, 0xA3, 0x01, 0x04, 0x02, 0x41, 0x10, 0x20,
+    0x50, 0x50, 0x93, 0x0F, 0xF4, 0x62, 0xA7, 0x7A, 0x35, 0x40, 0xCF,
+    0x54, 0x63, 0x25, 0xDE, 0xA2, 0x14,
 };
 
 void NasMm::receiveAuthenticationRequest(const nas::AuthenticationRequest &msg)
@@ -54,17 +66,103 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
     if (!currentPlmn.hasValue())
         return;
 
-    auto sendDummyEdhocResponse = [this, &msg, &currentPlmn](const eap::EapNotification &receivedEap) {
-        EdhocInitiator initiator{};
+    auto handleEdhocNotification = [this, &msg, &currentPlmn](const eap::EapNotification &receivedEap) {
         EadItemsC ead1{};
+        EadItemsC ead2{};
+        EadItemsC ead3{};
         EdhocMessageBuffer message1{};
+        EdhocMessageBuffer message2{};
+        EdhocMessageBuffer message3{};
+        IdCred idCredR{};
         uint8_t cI = 0;
+        uint8_t cR = 0;
+        uint8_t prkOut[SHA256_DIGEST_LEN] = {};
+        bool hasIdCredR = false;
+        CredentialC credI{};
         int8_t rc = 0;
 
         // If the incoming EAP payload is a Notification and its content is exactly:
         // “This is not ordinary EAP-AKA'; this is the prototype trigger for the EDHOC-PSK path.”
         if (receivedEap.rawData.toHexString() != OctetString::FromAscii("EDHOC-START").toHexString())
+        {
+            if (!m_edhocInProgress)
+                return false;
+
+            // Second EDHOC leg on UE: received message_2, then build/send message_3.
+            if (receivedEap.rawData.length() <= 0 ||
+                receivedEap.rawData.length() > static_cast<int>(sizeof(message2.content)))
+            {
+                m_logger->err("EDHOC: invalid message_2 length [%d]", receivedEap.rawData.length());
+                m_edhocInProgress = false;
+                return false;
+            }
+
+            message2.len = receivedEap.rawData.length();
+            std::memcpy(message2.content, receivedEap.rawData.data(), message2.len);
+
+            rc = initiator_parse_message_2(
+                &m_edhocInitiator, &message2,
+                &cR, &hasIdCredR, &idCredR, &ead2);
+            if (rc != 0)
+            {
+                m_logger->err("EDHOC: initiator_parse_message_2 failed [%d]", rc);
+                m_edhocInProgress = false;
+                return false;
+            }
+
+            rc = credential_new_symmetric(&credI,
+                                          EDHOC_PSK_CRED_I, sizeof(EDHOC_PSK_CRED_I));
+            if (rc != 0)
+            {
+                m_logger->err("EDHOC: credential_new_symmetric(I) failed [%d]", rc);
+                m_edhocInProgress = false;
+                return false;
+            }
+
+            rc = initiator_verify_message_2(
+                &m_edhocInitiator, nullptr, &credI, &m_edhocCredR);
+            if (rc != 0)
+            {
+                m_logger->err("EDHOC: initiator_verify_message_2 failed [%d]", rc);
+                m_edhocInProgress = false;
+                return false;
+            }
+
+            rc = initiator_prepare_message_3(
+                &m_edhocInitiator, ByReference, &ead3, &message3, &prkOut);
+            m_logger->info("EDHOC: initiator_prepare_message_3 rc=%d len=%d",
+                           rc, static_cast<int>(message3.len));
+            if (rc != 0)
+            {
+                m_logger->err("EDHOC: initiator_prepare_message_3 failed [%d]", rc);
+                m_edhocInProgress = false;
+                return false;
+            }
+            if (message3.len == 0)
+            {
+                m_logger->err("EDHOC: initiator_prepare_message_3 produced empty message_3");
+                m_edhocInProgress = false;
+                return false;
+            }
+
+            completed_without_message_4(&m_edhocInitiator);
+
+            nas::AuthenticationResponse resp;
+            resp.eapMessage = nas::IEEapMessage{};
+            resp.eapMessage->eap = std::make_unique<eap::EapNotification>(
+                eap::ECode::RESPONSE, receivedEap.id,
+                OctetString::FromArray(message3.content, message3.len));
+            m_logger->info("EDHOC: sending message_3 in authentication response [len=%d, c_r=%u, raw_message3=1]",
+                           static_cast<int>(message3.len), cR);
+            sendNasMessage(resp);
+            m_edhocInProgress = false;
+            return true;
+        }
+
+        if (m_edhocInProgress)
             return false;
+
+        // First EDHOC leg on UE: bootstrap marker received, generate/send message_1.
         m_logger->info("EDHOC: received dummy authentication request");
         // Since this is not AKA, the UE clears the AKA challenge/response temporary values.
         m_usim->m_rand = {};
@@ -89,19 +187,37 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
         m_nwConsecutiveAuthFailure = 0;
         m_timers->t3520.stop();
 
-        rc = initiator_new(&initiator, PSK);
+        rc = initiator_new(&m_edhocInitiator, PSK);
         if (rc != 0)
         {
             m_logger->err("EDHOC: initiator_new failed [%d]", rc);
             return false;
         }
 
-        rc = initiator_prepare_message_1(&initiator, &cI, &ead1, &message1);
+        rc = credential_new_symmetric(&credI,
+                                      EDHOC_PSK_CRED_I, sizeof(EDHOC_PSK_CRED_I));
+        if (rc != 0)
+        {
+            m_logger->err("EDHOC: credential_new_symmetric(I) failed [%d]", rc);
+            return false;
+        }
+
+        rc = credential_new_symmetric(&m_edhocCredR,
+                                      EDHOC_PSK_CRED_R, sizeof(EDHOC_PSK_CRED_R));
+        if (rc != 0)
+        {
+            m_logger->err("EDHOC: credential_new_symmetric(R) failed [%d]", rc);
+            return false;
+        }
+
+        rc = initiator_prepare_message_1(&m_edhocInitiator, &cI, &ead1, &message1);
         if (rc != 0)
         {
             m_logger->err("EDHOC: initiator_prepare_message_1 failed [%d]", rc);
             return false;
         }
+        m_edhocInProgress = true;
+        m_edhocCi = cI;
 
         nas::AuthenticationResponse resp;
         resp.eapMessage = nas::IEEapMessage{};
@@ -109,7 +225,7 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
             eap::ECode::RESPONSE, receivedEap.id,
             OctetString::FromArray(message1.content, message1.len));
         m_logger->info("EDHOC: sending real message_1 in authentication response [len=%d, c_i=%u]",
-                       message1.len, cI);
+                       static_cast<int>(message1.len), cI);
         sendNasMessage(resp);
         return true;
     };
@@ -154,7 +270,7 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
 
     if (msg.eapMessage->eap->eapType == eap::EEapType::NOTIFICATION)
     {
-        if (sendDummyEdhocResponse((const eap::EapNotification &)*msg.eapMessage->eap))
+        if (handleEdhocNotification((const eap::EapNotification &)*msg.eapMessage->eap))
             return;
 
         sendMmStatus(nas::EMmCause::SEMANTICALLY_INCORRECT_MESSAGE);
