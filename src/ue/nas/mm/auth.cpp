@@ -214,7 +214,7 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
             return false;
 
         // First EDHOC leg on UE: bootstrap marker received, generate/send message_1.
-        m_logger->info("EDHOC: received dummy authentication request");
+        m_logger->info("EDHOC: received EDHOC authentication request");
         // Since this is not AKA, the UE clears the AKA challenge/response temporary values.
         m_usim->m_rand = {};
         m_usim->m_resStar = {};
@@ -267,7 +267,7 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
         resp.eapMessage->eap = std::make_unique<eap::EapNotification>(
             eap::ECode::RESPONSE, receivedEap.id,
             OctetString::FromArray(message1.content, message1.len));
-        m_logger->info("EDHOC: sending real message_1 in authentication response [len=%d, c_i=%u]",
+        m_logger->info("EDHOC: sending EDHOC message_1 in authentication response [len=%d, c_i=%u]",
                        static_cast<int>(message1.len), cI);
         sendNasMessage(resp);
         return true;
