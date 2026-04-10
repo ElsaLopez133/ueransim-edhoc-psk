@@ -15,18 +15,6 @@
 namespace nr::ue
 {
 
-/*
- * If the NAS Authentication Request contains an EAP payload equal to EDHOC-START,
- * the UE does not run real EDHOC yet. Instead, it creates a dummy NAS security
- * context from a fixed dummy K_AUSF, derives K_SEAF/K_AMF, and replies with an
- * EAP Notification carrying EDHOC-RESPONSE.
- */
-static const uint8_t EDHOC_DUMMY_KAUSF_SEED[32] = {
-    0x45, 0x44, 0x48, 0x4f, 0x43, 0x5f, 0x50, 0x53,
-    0x4b, 0x5f, 0x44, 0x55, 0x4d, 0x4d, 0x59, 0x01,
-    0x45, 0x44, 0x48, 0x4f, 0x43, 0x5f, 0x50, 0x53,
-    0x4b, 0x5f, 0x44, 0x55, 0x4d, 0x4d, 0x59, 0x02,
-};
 static const uint8_t EDHOC_PSK_CRED_I[] = {
     0xA2, 0x02, 0x69, 0x69, 0x6E, 0x69, 0x74, 0x69, 0x61, 0x74, 0x6F,
     0x72, 0x08, 0xA1, 0x01, 0xA3, 0x01, 0x04, 0x02, 0x41, 0x10, 0x20,
@@ -39,9 +27,9 @@ static const uint8_t EDHOC_PSK_CRED_R[] = {
     0x50, 0x50, 0x93, 0x0F, 0xF4, 0x62, 0xA7, 0x7A, 0x35, 0x40, 0xCF,
     0x54, 0x63, 0x25, 0xDE, 0xA2, 0x14,
 };
-static const uint8_t EDHOC_M4_ACK[] = {
-    0x45, 0x44, 0x48, 0x4f, 0x43, 0x2d, 0x4d, 0x34, 0x2d, 0x41, 0x43, 0x4b,
-};
+static constexpr uint8_t EDHOC_EMSK_EXPORTER_LABEL = 27;
+static constexpr size_t EDHOC_EMSK_LEN = 64;
+static constexpr size_t EDHOC_KAUSF_LEN = 32;
 
 void NasMm::receiveAuthenticationRequest(const nas::AuthenticationRequest &msg)
 {
@@ -112,17 +100,35 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
                     return false;
                 }
 
+                if (!m_usim->m_nonCurrentNsCtx)
+                {
+                    m_logger->err("EDHOC: NAS security context missing after message_4");
+                    m_edhocAwaitingMessage4 = false;
+                    return false;
+                }
+
+                uint8_t emsk[EDHOC_EMSK_LEN] = {};
+                rc = initiator_edhoc_exporter(&m_edhocInitiator, EDHOC_EMSK_EXPORTER_LABEL, nullptr, 0,
+                                             emsk, sizeof(emsk));
+                if (rc != 0)
+                {
+                    m_logger->err("EDHOC: initiator_edhoc_exporter failed [%d]", rc);
+                    m_edhocAwaitingMessage4 = false;
+                    return false;
+                }
+
+                m_usim->m_nonCurrentNsCtx->keys.kAusf = OctetString::FromArray(emsk, EDHOC_KAUSF_LEN);
+                keys::DeriveKeysSeafAmf(*m_base->config, currentPlmn, *m_usim->m_nonCurrentNsCtx);
+
                 // NOTE: This is NOT an EDHOC protocol message and not required by EDHOC-PSK.
                 // It is a transport/state-machine trigger for the current Open5GS integration,
                 // where AUSF/AMF expects one additional UE AuthenticationResponse after relaying
                 // EDHOC message_4 before proceeding with normal 5GS flow.
-                // FIXME(open5gs-edhoc): remove this extra EAP Notification once AUSF/AMF is
-                // refactored to finalize authentication immediately after message_4.
                 nas::AuthenticationResponse resp;
                 resp.eapMessage = nas::IEEapMessage{};
                 resp.eapMessage->eap = std::make_unique<eap::EapNotification>(
                     eap::ECode::RESPONSE, receivedEap.id,
-                    OctetString::FromArray(EDHOC_M4_ACK, sizeof(EDHOC_M4_ACK)));
+                    OctetString{});
                 m_logger->info("EDHOC: processed message_4 and sent post-message_4 acknowledgement");
                 sendNasMessage(resp);
                 m_edhocAwaitingMessage4 = false;
@@ -211,21 +217,12 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
         m_usim->m_rand = {};
         m_usim->m_resStar = {};
 
-        /*
-        *  it allocates a new partial native NAS security context
-        *  it copies: ngKSI, ABBA, and sets kAusf = dummy seed
-        *  So for the rest of the UE stack, it now looks like
-        *  “Authentication has yielded a valid K_AUSF-like input, from which I can continue the standard 5GS key ladder.”
-         */
+        // Allocate the partial native NAS security context now; populate the real K_AUSF
+        // only after EDHOC completes and the exporter is available.
         m_usim->m_nonCurrentNsCtx = std::make_unique<NasSecurityContext>();
         m_usim->m_nonCurrentNsCtx->tsc = msg.ngKSI.tsc;
         m_usim->m_nonCurrentNsCtx->ngKsi = msg.ngKSI.ksi;
-        m_usim->m_nonCurrentNsCtx->keys.kAusf =
-            OctetString::FromArray(EDHOC_DUMMY_KAUSF_SEED, sizeof(EDHOC_DUMMY_KAUSF_SEED));
         m_usim->m_nonCurrentNsCtx->keys.abba = msg.abba.rawData.copy();
-
-        // “Once I have a K_AUSF-shaped input, I re-enter the standard 5GS key derivation chain.”
-        keys::DeriveKeysSeafAmf(*m_base->config, currentPlmn, *m_usim->m_nonCurrentNsCtx);
 
         m_nwConsecutiveAuthFailure = 0;
         m_timers->t3520.stop();
