@@ -130,6 +130,7 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
                     eap::ECode::RESPONSE, receivedEap.id,
                     OctetString{});
                 m_logger->info("EDHOC: processed message_4 and sent post-message_4 acknowledgement");
+                m_timers->t3520.stop();
                 sendNasMessage(resp);
                 m_edhocAwaitingMessage4 = false;
                 return true;
@@ -202,6 +203,7 @@ void NasMm::receiveAuthenticationRequestEap(const nas::AuthenticationRequest &ms
                 OctetString::FromArray(message3.content, message3.len));
             m_logger->info("EDHOC: sending message_3 in authentication response [len=%d, c_r=%u, raw_message3=1]",
                            static_cast<int>(message3.len), cR);
+            m_timers->t3520.stop();
             sendNasMessage(resp);
             m_edhocInProgress = false;
             m_edhocAwaitingMessage4 = true;
@@ -649,6 +651,8 @@ void NasMm::receiveAuthenticationRequest5gAka(const nas::AuthenticationRequest &
 
 void NasMm::receiveAuthenticationResult(const nas::AuthenticationResult &msg)
 {
+    m_timers->t3520.stop();
+
     if (msg.abba.has_value())
         m_usim->m_nonCurrentNsCtx->keys.abba = msg.abba->rawData.copy();
 
@@ -668,6 +672,7 @@ void NasMm::receiveAuthenticationReject(const nas::AuthenticationReject &msg)
     m_usim->m_rand = {};
     m_usim->m_resStar = {};
     m_timers->t3516.stop();
+    m_timers->t3520.stop();
     m_edhocInProgress = false;
     m_edhocAwaitingMessage4 = false;
 
@@ -702,7 +707,8 @@ void NasMm::receiveAuthenticationReject(const nas::AuthenticationReject &msg)
 
 void NasMm::receiveEapSuccessMessage(const eap::Eap &eap)
 {
-    // EAP success finalizes authentication; clear any EDHOC transient state.
+    // EAP success finalizes authentication; clear any pending authentication timer and EDHOC transient state.
+    m_timers->t3520.stop();
     m_edhocInProgress = false;
     m_edhocAwaitingMessage4 = false;
 }
@@ -712,6 +718,7 @@ void NasMm::receiveEapFailureMessage(const eap::Eap &eap)
     m_logger->debug("Handling EAP-failure");
 
     // UE shall delete the partial native 5G NAS security context if any was created
+    m_timers->t3520.stop();
     m_usim->m_nonCurrentNsCtx = {};
     m_edhocInProgress = false;
     m_edhocAwaitingMessage4 = false;
